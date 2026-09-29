@@ -1,1 +1,3 @@
 # PNU-TECHWEEK-260930
+
+부산대학교 TECH WEEK: Physical AI
