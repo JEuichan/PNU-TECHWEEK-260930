@@ -98,23 +98,35 @@ def main():
                 r_arr = _np.asarray(ranges)
                 for name, conf, (x0, y0, x1, y1) in \
                         mission.detector.yolo_boxes(img):
-                    if name not in FURNITURE_CLASSES or conf < 0.35:
+                    if name not in FURNITURE_CLASSES or conf < 0.45:
                         continue
                     if y1 < h_ * 0.5:     # 화면 위쪽 절반뿐 → 원거리/벽면
                         continue
-                    cx_b = (x0 + x1) / 2.0
-                    b = math.atan2(w_ / 2.0 - cx_b, f_px)
-                    sel = _np.abs(_wrap(a_arr - b)) < 0.2
+                    # bbox 각도 범위의 LiDAR 프로파일로 '투과성' 검증:
+                    # 탁자·의자는 다리 사이로 빔이 통과해 최근접보다
+                    # 0.4m+ 깊은 빔이 상당수 나온다. 문·벽·판형 가구는
+                    # 전 빔이 같은 평면에 꽂힘 → 가구 구역 아님 (문을
+                    # 가구로 등록해 통로를 회피하던 오인식 차단)
+                    b_lo = math.atan2(w_ / 2.0 - x1, f_px)
+                    b_hi = math.atan2(w_ / 2.0 - x0, f_px)
+                    bc = 0.5 * (b_lo + b_hi)
+                    hw = 0.5 * (b_hi - b_lo) + 0.05
+                    sel = _np.abs(_wrap(a_arr - bc)) < hw
                     rr2 = r_arr[sel]
                     rr2 = rr2[_np.isfinite(rr2) & (rr2 > 0.15)]
-                    if rr2.size == 0:
+                    if rr2.size < 5:
                         continue
                     d = float(rr2.min())
                     if d > 2.5:
                         continue
-                    fx = pose[0] + d * math.cos(pose[2] + b)
-                    fy = pose[1] + d * math.sin(pose[2] + b)
-                    mission.note_furniture((fx, fy))
+                    deep_frac = float((rr2 > d + 0.4).mean())
+                    if deep_frac < 0.25:
+                        continue          # 판형(문/벽/장) — 등록 금지
+                    fx = pose[0] + d * math.cos(pose[2] + bc)
+                    fy = pose[1] + d * math.sin(pose[2] + bc)
+                    mission.note_furniture(
+                        (fx, fy), now=now,
+                        label=f"{name} {conf:.2f} 투과{deep_frac:.0%}")
             except Exception as e:
                 print(f"[sar] 가구 스캔 실패: {e}")
 

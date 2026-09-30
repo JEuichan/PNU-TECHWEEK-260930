@@ -165,6 +165,12 @@ class Planner:
         self.furniture_xy = []       # YOLO 가구 구역 — 밑으로 안 파고들게
         self.last_plan_soft = False  # 마지막 경로가 팽창 완화(halo 통과)였나
         self.soft_spots = []         # 경로 중 halo(좁은 틈) 구간 월드 좌표
+        # 좁은 틈 정렬 기동: (정렬점, 틈 중앙, 출구점) — 문·가구 틈은
+        # 곡선으로 스치지 않고 "전방 정렬 → 회전 → 중앙 직진 관통"
+        self.gap_maneuver = None
+        self._gap_ax = (1.0, 0.0)
+        self._gap_staged = False
+        self._gap_half = 0.0
 
     @property
     def goal(self):
@@ -281,6 +287,49 @@ class Planner:
             g.grid_to_world(cx, cy) for cx, cy in path[::2]
             if 0 <= cy < g.n and 0 <= cx < g.n and halo[cy, cx]][:80]
         self.last_plan_soft = bool(self.soft_spots)
+        # 첫 번째 좁은 틈에 대한 정렬 관통 기동 계산: 곡선 추종으로
+        # 비스듬히 스치지 말고 "틈 전방 정렬점 → 제자리 회전 → 중앙
+        # 직진 관통" (문 앞 버벅임 제거)
+        self.gap_maneuver = None
+        in_halo = [0 <= cy < g.n and 0 <= cx < g.n and bool(halo[cy, cx])
+                   for cx, cy in path]
+        if any(in_halo):
+            s_i = in_halo.index(True)
+            e_i = s_i
+            while e_i + 1 < len(path) and in_halo[e_i + 1]:
+                e_i += 1
+            entry = g.grid_to_world(*path[s_i])
+            exit_ = g.grid_to_world(*path[e_i])
+            ctr = ((entry[0] + exit_[0]) / 2, (entry[1] + exit_[1]) / 2)
+            dx_, dy_ = exit_[0] - entry[0], exit_[1] - entry[1]
+            l_ = math.hypot(dx_, dy_)
+            if l_ < 1e-6:      # 한 셀짜리 틈: 축은 앞뒤 경로에서
+                p0 = g.grid_to_world(*path[max(0, s_i - 1)])
+                p1 = g.grid_to_world(*path[min(len(path) - 1, e_i + 1)])
+                dx_, dy_ = p1[0] - p0[0], p1[1] - p0[1]
+                l_ = math.hypot(dx_, dy_) or 1.0
+            ax = (dx_ / l_, dy_ / l_)
+            half = l_ / 2
+            stg = (ctr[0] - ax[0] * (half + 0.40),
+                   ctr[1] - ax[1] * (half + 0.40))
+            lv = (ctr[0] + ax[0] * (half + 0.35),
+                  ctr[1] + ax[1] * (half + 0.35))
+            proj = (pose[0] - ctr[0]) * ax[0] + (pose[1] - ctr[1]) * ax[1]
+            # 짧은 조임 구간(진짜 문/틈)만 — 벽을 낀 긴 halo 구간(좁은
+            # 방 내부 이동 전체 등)에 이 축 계산을 적용하면 축·중앙이
+            # 엉뚱해져 문설주로 돌진한다. 정렬·출구점이 차단 셀이어도
+            # 취소 (일반 추종 + 완화가 대신 처리).
+            si, sj = g.world_to_grid(*stg)
+            li, lj = g.world_to_grid(*lv)
+            pts_free = (0 <= sj < g.n and 0 <= si < g.n
+                        and 0 <= lj < g.n and 0 <= li < g.n
+                        and not blocked[sj, si] and not blocked[lj, li])
+            if l_ <= 0.55 and pts_free and proj <= half + 0.05:
+                self.gap_maneuver = (stg, ctr, lv)
+                self._gap_ax = ax
+                self._gap_half = half
+                # 이미 틈 어귀/안이면 정렬 단계 생략, 곧장 관통
+                self._gap_staged = proj > -(half + 0.25)
         # LOS 단축 시 사람 캡슐(penalty)도 벽 취급 — 지름길이 캡슐을
         # 관통하면 A*의 우회가 무의미해진다
         los_blocked = blocked | penalty if penalty is not None else blocked
@@ -297,6 +346,34 @@ class Planner:
         while len(self.waypoints) > 1 \
                 and dist(pose, self.waypoints[0]) < cfg.plan.lookahead * 0.45:
             self.waypoints.pop(0)
+        # 좁은 틈 정렬 관통 기동이 활성이고 틈이 가까우면 pure pursuit
+        # 대신 3점 기동: 정렬점까지 → (제자리 회전) → 출구점까지 직진.
+        # lookahead 곡선 추종은 문설주를 비스듬히 스치며 버벅인다.
+        if self.gap_maneuver is not None:
+            stg, ctr, lv = self.gap_maneuver
+            ax = self._gap_ax
+            proj = (pose[0] - ctr[0]) * ax[0] + (pose[1] - ctr[1]) * ax[1]
+            if proj > self._gap_half + 0.28 or dist(pose, lv) < 0.13:
+                self.gap_maneuver = None         # 통과 완료
+            elif dist(pose, ctr) < 1.3:
+                if not self._gap_staged:
+                    target = stg
+                    if dist(pose, stg) < 0.13:
+                        self._gap_staged = True
+                        target = lv
+                else:
+                    target = lv
+                heading = math.atan2(target[1] - pose[1],
+                                     target[0] - pose[0])
+                err = wrap_angle(heading - pose[2])
+                w = max(-cfg.robot.max_w,
+                        min(cfg.robot.max_w, cfg.plan.k_heading * err))
+                # 정렬 전(오차 큼)엔 제자리 회전, 정렬되면 직진
+                v = cfg.robot.max_v \
+                    * max(0.0, 1.0 - abs(err) / (math.pi / 3))
+                if abs(err) < 0.6:
+                    w *= max(0.35, v / cfg.robot.max_v)
+                return v, w
         # lookahead 점 선택
         target = self.waypoints[0]
         for wp in self.waypoints:

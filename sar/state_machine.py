@@ -291,16 +291,25 @@ class Mission:
             self.target_est = (self.target_est[0] * (1 - a) + accepted[0] * a,
                                self.target_est[1] * (1 - a) + accepted[1] * a)
 
-    def note_furniture(self, xy):
-        """컨트롤러의 YOLO 가구 탐지 보고 — 0.6m 내 기존 구역과 병합."""
+    def note_furniture(self, xy, now=0.0, label=""):
+        """컨트롤러의 YOLO 가구 탐지 보고 — 0.6m 내 기존 구역과 병합.
+
+        구역은 TTL(75s)로 자연 소멸 — 오인식 한 방이 통로를 영구히
+        비싸게 만드는 것을 방지. 재관측되면 갱신되어 유지된다."""
         for z in self.furniture_zones:
-            if dist(xy, z) < 0.6:
+            if dist(xy, (z[0], z[1])) < 0.6:
+                z[2] = now                   # 재관측 → TTL 갱신
                 return
-        self.furniture_zones.append(tuple(xy))
+        self.furniture_zones.append([xy[0], xy[1], now])
         if len(self.furniture_zones) > 30:
             self.furniture_zones.pop(0)
-        print(f"[mission] 가구 구역 기록 ({xy[0]:+.2f},{xy[1]:+.2f}) — "
-              f"경로가 밑으로 파고들지 않게 회피")
+        print(f"[mission] 가구 구역 기록 ({xy[0]:+.2f},{xy[1]:+.2f}) "
+              f"[{label}] — 경로가 밑으로 파고들지 않게 회피")
+
+    def _furniture_valid(self, now):
+        self.furniture_zones = [z for z in self.furniture_zones
+                                if now - z[2] < 75.0]
+        return [(z[0], z[1]) for z in self.furniture_zones]
 
     def _add_candidate(self, xy, near):
         """목표 후보 등록/병합 — 가까운 관측일수록 위치 가중치 높게."""
@@ -607,6 +616,14 @@ class Mission:
             self._recover_escalate = self._stuck_count >= 2
             self._last_stuck_t = now
             self._recover_after = self.state
+            if self.state == self.SEEK:
+                # SEEK 중 갇힘 = 시선 방향이 물리적으로 막힘 — SEEK로
+                # 복귀하면 같은 자리서 응시→갇힘 무한 루프 (타임아웃은
+                # 재진입마다 리셋돼 영영 안 걸린다). 탐사로 돌리고 잠시
+                # SEEK 금지 → 지도가 자라면 다른 각도로 재접근한다.
+                self._recover_after = self.EXPLORE
+                self._seek_block_until = max(self._seek_block_until,
+                                             now + 15.0)
             self._recover_phase = ("backup", now)
             self._pose_hist.clear()
             if self._stuck_count >= 3 and self.state == self.EXPLORE:
@@ -614,8 +631,9 @@ class Mission:
                 self._stuck_count = 0
             self._enter(self.RECOVER, now)
 
-        # 가구 구역을 경로 페널티로 전달 (사람 캡슐과 같은 채널)
-        self.planner.furniture_xy = self.furniture_zones
+        # 가구 구역을 경로 페널티로 전달 (사람 캡슐과 같은 채널, TTL 적용)
+        fz = self._furniture_valid(now)
+        self.planner.furniture_xy = fz
 
         # 동적 장애물 분류 + 사람 위치 추정 (경로의 소프트 회피용)
         dyn = self._classify_dynamic(pose, angles, ranges)
@@ -723,7 +741,7 @@ class Mission:
             "visited": len(self.visited_targets),
             "reached": self.target_reached,
             "candidates": [c["xy"] for c in self.candidates],
-            "furniture": list(self.furniture_zones),
+            "furniture": list(self.planner.furniture_xy),
         }
         return v, w, info
 
@@ -937,7 +955,7 @@ class Mission:
             return 0.0, 0.0
 
         target = self.explorer.update(pose, person_xy=self.planner.avoid_xy,
-                                      furniture=self.furniture_zones)
+                                      furniture=self.planner.furniture_xy)
         # frontier 도착 = 새 시야가 열린 순간 → 카메라 스윕 1회
         if self.explorer.just_reached:
             self.explorer.just_reached = False
