@@ -49,6 +49,7 @@ class Mission:
         self._spin_phase = "left"         # 부분 스윕 상태
         self._force_full_spin = False     # frontier 소진 시 마지막 360도
         self._final_spin_done = False
+        self._known_at_spin = 0           # 직전 스핀 시점의 기지(旣知) 셀 수
 
         self.target_est = None       # (x, y) 현재 추적 중인 목표 추정
         self._est_hist = []          # 최근 채택된 추정들 (안정성 게이트용)
@@ -109,6 +110,7 @@ class Mission:
         if state == self.SPIN:
             # 정지 스캔 구간이 stuck 이력에 섞이면 스핀 직후 오탐이 난다
             self._pose_hist.clear()
+            self._mark_spin()
         self.state = state
         self.state_since = now
 
@@ -343,6 +345,17 @@ class Mission:
                    key=lambda c: (c["w"] >= 2.0, -dist(pose, c["xy"])))
         self.candidates.remove(best)
         return best["xy"]
+
+    def _spin_worthwhile(self):
+        """지난 카메라 스윕 이후 지도가 유의미하게 자랐는가.
+
+        안 자랐다 = 이미 훑은 구역을 재통과 중 — 여기서 또 도는 건
+        순수 낭비다. 새 방에 들어서면 성장이 감지되어 스윕이 돌아온다."""
+        known_now = int((~self.grid.unknown_mask()).sum())
+        return known_now - self._known_at_spin >= 250   # ≈0.6m² 신규
+
+    def _mark_spin(self):
+        self._known_at_spin = int((~self.grid.unknown_mask()).sum())
 
     def _mapping_state(self):
         """지도 우선 모드에서 '하던 일'로 돌아갈 상태."""
@@ -822,12 +835,13 @@ class Mission:
         # 주기 카메라 스윕 (후보 발견은 카메라 몫 — 벽만 보면 못 찾는다)
         if cfg.explore.spin_period > 0 \
                 and now - self.last_spin_t > cfg.explore.spin_period:
-            self.spin_accum = 0.0
-            self._spin_phase = "left"
             self.last_spin_t = now
-            self._spin_return_state = self.WALL_FOLLOW
-            self._enter(self.SPIN, now)
-            return 0.0, 0.0
+            if self._spin_worthwhile():
+                self.spin_accum = 0.0
+                self._spin_phase = "left"
+                self._spin_return_state = self.WALL_FOLLOW
+                self._enter(self.SPIN, now)
+                return 0.0, 0.0
         # 루프 폐합 / 타임아웃 판정
         if self._wf_anchor is None:
             self._wf_anchor = (pose[0], pose[1])
@@ -943,28 +957,31 @@ class Mission:
 
     def _do_explore(self, now, pose, angles, ranges):
         cfg = self.cfg
-        # 주기적 카메라 스캔 (진입 시각을 즉시 기록 — 스핀이 SEEK 등에
-        # 선점돼도 곧바로 재진입하며 겉도는 것 방지)
+        # 주기적 카메라 스캔 — 단, 지난 스윕 이후 지도가 새로 자랐을
+        # 때만 (이미 훑은 구역 재통과 중의 회전은 순수 시간 낭비)
         if cfg.explore.spin_period > 0 \
                 and now - self.last_spin_t > cfg.explore.spin_period:
-            self.spin_accum = 0.0
-            self._spin_phase = "left"
-            self.last_spin_t = now
-            self._spin_return_state = self.EXPLORE
-            self._enter(self.SPIN, now)
-            return 0.0, 0.0
+            self.last_spin_t = now      # 게이트 불통과 시에도 주기 리셋
+            if self._spin_worthwhile():
+                self.spin_accum = 0.0
+                self._spin_phase = "left"
+                self._spin_return_state = self.EXPLORE
+                self._enter(self.SPIN, now)
+                return 0.0, 0.0
 
         target = self.explorer.update(pose, person_xy=self.planner.avoid_xy,
                                       furniture=self.planner.furniture_xy)
         # frontier 도착 = 새 시야가 열린 순간 → 카메라 스윕 1회
+        # (여기도 신규 지도 게이트 — 열린 게 없으면 그냥 다음으로)
         if self.explorer.just_reached:
             self.explorer.just_reached = False
-            self.spin_accum = 0.0
-            self._spin_phase = "left"
-            self.last_spin_t = now
-            self._spin_return_state = self.EXPLORE
-            self._enter(self.SPIN, now)
-            return 0.0, 0.0
+            if self._spin_worthwhile():
+                self.spin_accum = 0.0
+                self._spin_phase = "left"
+                self.last_spin_t = now
+                self._spin_return_state = self.EXPLORE
+                self._enter(self.SPIN, now)
+                return 0.0, 0.0
         if target is None:
             # frontier 소진: 블랙리스트 때문일 수 있으니 사면 후 재시도
             # (최대 2회 — 진짜 소진이면 복귀 fail-safe)
