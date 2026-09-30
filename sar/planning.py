@@ -162,6 +162,7 @@ class Planner:
         self.avoid_xy = None         # 동적 장애물(사람) 현재 위치 — 소프트 회피
         self.avoid_vel = None        # 사람 속도 벡터 (예측 캡슐 페널티용)
         self.avoid_territory = []    # 사람이 다녀간 자리들 (순찰 영토)
+        self.furniture_xy = []       # YOLO 가구 구역 — 밑으로 안 파고들게
         self.last_plan_soft = False  # 마지막 경로가 팽창 완화(halo 통과)였나
 
     @property
@@ -207,11 +208,27 @@ class Planner:
             outside[y0:y1, x0:x1] = False
             blocked = blocked | outside
         penalty = None
+        if self.furniture_xy:
+            # 가구(탁자 다리 사이 등) 구역: 통과 불가는 아니지만 비싸게 —
+            # 다른 길이 있으면 밑으로 파고들지 않는다
+            penalty = np.zeros_like(blocked)
+            g = self.grid
+            r_c = max(2, int(0.45 / g.res))
+            for fx, fy in self.furniture_xy:
+                pcx, pcy = g.world_to_grid(fx, fy)
+                y0f, y1f = max(0, pcy - r_c), min(g.n, pcy + r_c + 1)
+                x0f, x1f = max(0, pcx - r_c), min(g.n, pcx + r_c + 1)
+                if y0f >= y1f or x0f >= x1f:
+                    continue
+                yy, xx = np.ogrid[y0f:y1f, x0f:x1f]
+                penalty[y0f:y1f, x0f:x1f] |= \
+                    (xx - pcx) ** 2 + (yy - pcy) ** 2 <= r_c * r_c
         if self.avoid_xy is not None:
             # 사람의 '예측 쓸기 경로' 캡슐: 현재 위치 + 속도×[0, 2.5s]
             # 를 따라 원을 찍는다. 등 뒤(-이동 반대쪽)는 페널티가 없으므로
             # 경로가 자연스럽게 "떠나는 사람 뒤로 건너기"가 된다.
-            penalty = np.zeros_like(blocked)
+            if penalty is None:
+                penalty = np.zeros_like(blocked)
             g = self.grid
             px, py = self.avoid_xy
             vx, vy = self.avoid_vel or (0.0, 0.0)

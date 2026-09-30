@@ -45,6 +45,8 @@ class MapViz:
                 dot(p[0], p[1], (80, 130, 255), 1)
             for c in info.get("candidates") or []:
                 dot(c[0], c[1], (200, 0, 220), 2)   # 보라: 목표 후보
+            for f in info.get("furniture") or []:
+                dot(f[0], f[1], (150, 95, 40), 2)   # 갈색: 가구 회피 구역
             if info.get("goal"):
                 dot(info["goal"][0], info["goal"][1], (0, 80, 255), 3)
             if info.get("target_est"):

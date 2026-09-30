@@ -237,6 +237,24 @@ def test_compass_calibration():
     assert abs(est.pose[2] - (math.pi / 2 + 0.4)) < 1e-6, est.pose
 
 
+def test_clipped_blob_no_estimate():
+    """좌우 잘린 블롭은 위치 추정 금지 — 모서리에 걸친 소화기 하반신이
+    '0.6m 사과'로 확정되던 실사고 회귀."""
+    from sar.detection import Detection
+    from sar.state_machine import Mission
+    cfg = default_config()
+    grid = OccupancyGrid(cfg, center_xy=(0.0, 0.0))
+    m = Mission(cfg, grid)
+    m.detector.last = Detection(
+        bearing=0.3, pixels=20000, cx_ratio=0.1, area_rows=229,
+        px_width=139, ang_width=0.21, clipped=True,
+        bbox=(0, 85, 139, 314), aspect=0.61, v_clipped=False, fill=0.62)
+    angles = np.linspace(-math.pi, math.pi, 360, endpoint=False)
+    ranges = np.full(360, 0.62)
+    m._update_target_estimate((0.0, 0.0, 0.0), angles, ranges)
+    assert m.target_est is None, "잘린 블롭이 위치 추정을 만들면 안 됨"
+
+
 def test_plan_soft_relief():
     """표준 팽창으로 닫힌 0.34m 틈 — 소프트 완화 재시도가 경로를 찾는다.
 

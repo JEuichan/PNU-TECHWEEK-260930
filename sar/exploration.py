@@ -72,11 +72,13 @@ class FrontierExplorer:
             self.blacklist.append(self.current_target)
             self.current_target = None
 
-    def update(self, pose, person_xy=None):
+    def update(self, pose, person_xy=None, furniture=()):
         """탐색 목표 반환 ((x,y) 또는 None=frontier 소진).
 
         person_xy가 있으면 그 주변 frontier의 점수를 깎는다 — 움직이는
         사람이 있는 쪽은 뒤로 미루고 반대 방향부터 탐색 (동선 겹침 회피).
+        furniture(YOLO 가구 구역) 근처 frontier도 후순위 — 탁자 밑
+        미탐색 셀을 굳이 기어들어가 밝히지 않는다.
         """
         # 관성: 유효한 기존 목표 유지
         if self.current_target is not None:
@@ -100,6 +102,8 @@ class FrontierExplorer:
             score = len(comp) / (d ** 1.7)
             if person_xy is not None and dist(rep, person_xy) < 2.5:
                 score *= 0.35        # 사람 있는 방향은 후순위
+            if any(dist(rep, f) < 0.7 for f in furniture):
+                score *= 0.25        # 가구 밑 frontier는 최후순위
             if score > best_score:
                 best, best_score = rep, score
         self.current_target = best

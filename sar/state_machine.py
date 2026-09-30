@@ -70,6 +70,11 @@ class Mission:
         self._wf_path = 0.0
         self._wf_last = None
 
+        # YOLO가 인식한 가구(탁자·의자 등) 구역 — 밑으로 기어들어가
+        # 갇히는 것을 '예방': A* 페널티 + frontier 후순위. 갇힘 탈출
+        # 스택은 이 레이어가 뚫렸을 때의 최후 수단.
+        self.furniture_zones = []    # [(x, y)]
+
         # stuck 감지
         self._pose_hist = []         # [(t, x, y)]
         self._recover_phase = None   # ("backup"|"align"|"creep", 시작시각)
@@ -216,6 +221,13 @@ class Mission:
         if det is None:
             return
         dcfg = self.cfg.detection
+        # 좌우 잘림 블롭은 위치 추정 금지 — 잘린 물체는 종횡비·채움비·
+        # 크기 일관성이 전부 '보이는 조각' 기준이라 무의미하다. 화면
+        # 모서리에 하반신만 걸친 소화기가 "0.6m 사과"로 확정된 실사고:
+        # bbox=(0,85,139,314), aspect 0.61, fill 0.62, LiDAR 크기비 1.3
+        # — 게이트 전부 통과. SEEK가 중앙에 세우면 온전한 게이트로 재평가.
+        if det.clipped:
+            return
         # 확정용 형태 게이트: 온전한 원형(가림 해소)일 때만 위치 추정 채택.
         # 가려진 반달 사과는 단안 거리가 2배로 튀므로 SEEK로 더 접근시킨다.
         if not det.v_clipped and not (0.55 <= det.aspect <= 1.7):
@@ -271,6 +283,17 @@ class Mission:
             a = 0.35
             self.target_est = (self.target_est[0] * (1 - a) + accepted[0] * a,
                                self.target_est[1] * (1 - a) + accepted[1] * a)
+
+    def note_furniture(self, xy):
+        """컨트롤러의 YOLO 가구 탐지 보고 — 0.6m 내 기존 구역과 병합."""
+        for z in self.furniture_zones:
+            if dist(xy, z) < 0.6:
+                return
+        self.furniture_zones.append(tuple(xy))
+        if len(self.furniture_zones) > 30:
+            self.furniture_zones.pop(0)
+        print(f"[mission] 가구 구역 기록 ({xy[0]:+.2f},{xy[1]:+.2f}) — "
+              f"경로가 밑으로 파고들지 않게 회피")
 
     def _add_candidate(self, xy, near):
         """목표 후보 등록/병합 — 가까운 관측일수록 위치 가중치 높게."""
@@ -496,6 +519,12 @@ class Mission:
             # 빨간 음료캔 같은 색·기하 통과형 디코이 방어.
             if self.detector.yolo_confirm(camera_img, self.detector.last):
                 self.target_found = True
+                self._confirm_img = camera_img       # 검증용 확정 프레임
+                d0 = self.detector.last
+                print(f"[mission] 목표 확정 est=({self.target_est[0]:+.2f},"
+                      f"{self.target_est[1]:+.2f}) aspect={d0.aspect:.2f} "
+                      f"fill={d0.fill:.2f} ang_w={d0.ang_width:.3f} "
+                      f"bbox={d0.bbox}")
             else:
                 print(f"[mission] YOLO 기각 → 디코이 등록 "
                       f"({self.target_est[0]:+.2f},{self.target_est[1]:+.2f})")
@@ -547,6 +576,9 @@ class Mission:
                 self.explorer.fail_current()
                 self._stuck_count = 0
             self._enter(self.RECOVER, now)
+
+        # 가구 구역을 경로 페널티로 전달 (사람 캡슐과 같은 채널)
+        self.planner.furniture_xy = self.furniture_zones
 
         # 동적 장애물 분류 + 사람 위치 추정 (경로의 소프트 회피용)
         dyn = self._classify_dynamic(pose, angles, ranges)
@@ -652,6 +684,7 @@ class Mission:
             "visited": len(self.visited_targets),
             "reached": self.target_reached,
             "candidates": [c["xy"] for c in self.candidates],
+            "furniture": list(self.furniture_zones),
         }
         return v, w, info
 
@@ -854,7 +887,8 @@ class Mission:
             self._enter(self.SPIN, now)
             return 0.0, 0.0
 
-        target = self.explorer.update(pose, person_xy=self.planner.avoid_xy)
+        target = self.explorer.update(pose, person_xy=self.planner.avoid_xy,
+                                      furniture=self.furniture_zones)
         # frontier 도착 = 새 시야가 열린 순간 → 카메라 스윕 1회
         if self.explorer.just_reached:
             self.explorer.just_reached = False
@@ -944,7 +978,10 @@ class Mission:
             self._enter(self.EXPLORE, now)
             return 0.0, 0.0
         goal = self._approach_goal(pose)
-        if dist(pose, goal) < cfg.mission.target_reach_tol:
+        # 최소 체류 0.3s: 확정 즉시 방문 판정되면 (추정이 이미 코앞)
+        # 확정 프레임 저장·상태 표시가 전부 스킵되는 원턴 방문이 된다
+        if dist(pose, goal) < cfg.mission.target_reach_tol \
+                and now - self.state_since > 0.3:
             # 현재 목표 방문 완료 — 전부 채웠으면 복귀, 남았으면 탐색 재개
             self.visited_targets.append(self.target_est)
             k = len(self.visited_targets)
