@@ -554,12 +554,13 @@ class LocalAvoider:
                 elif d_min < cfg.plan.dyn_yield_dist and approaching \
                         and not passing:
                     lat_ = self._miss_lat(pose, person_xy, person_vel)
-                # 서 있어도 안전한 자리인가: 선로 이격 0.35m+ 확인됐거나
-                # 아직 충분히 멀 때만. 속도 미상(반환점 등)이면 근접
-                # 정지 양보 금지 — 그 자리가 선로 위일 수 있다.
-                safe_spot = (lat_ is not None and lat_ >= 0.35) \
-                    or d_min >= 0.7
-                if abs(b) < 1.05 and safe_spot:
+                    # 서 있어도 안전한 자리인가: 선로 이격 0.35m+ 확인
+                    # 됐거나 아직 충분히 멀 때만. 속도 미상(반환점 등)
+                    # 이면 근접 정지 양보 금지 — 그 자리가 선로 위일
+                    # 수 있다.
+                    safe_spot = (lat_ is not None and lat_ >= 0.35) \
+                        or d_min >= 0.7
+                    if abs(b) < 1.05 and safe_spot:
                         # 위협이 진행방향 안 → 양보 (멀면 서행, 가까우면 정지)
                         self.last_mode = dyn_action = "yield"
                         if self._yield_since is None:
