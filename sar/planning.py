@@ -28,6 +28,9 @@ def astar(blocked, unknown, start, goal, unknown_cost=2.5, max_pop=120000,
     n_y, n_x = blocked.shape
     sx, sy = start
     gx, gy = goal
+    # start도 경계 클램프 — 그리드 가장자리 포즈에서 IndexError 방지
+    sx = min(max(sx, 1), n_x - 2)
+    sy = min(max(sy, 1), n_y - 2)
     gx = min(max(gx, 1), n_x - 2)
     gy = min(max(gy, 1), n_y - 2)
     if blocked[sy, sx]:
@@ -159,6 +162,7 @@ class Planner:
         self.avoid_xy = None         # 동적 장애물(사람) 현재 위치 — 소프트 회피
         self.avoid_vel = None        # 사람 속도 벡터 (예측 캡슐 페널티용)
         self.avoid_territory = []    # 사람이 다녀간 자리들 (순찰 영토)
+        self.last_plan_soft = False  # 마지막 경로가 팽창 완화(halo 통과)였나
 
     @property
     def goal(self):
@@ -192,6 +196,7 @@ class Planner:
         # 그리드 전체(수십만 셀)의 미지 바다를 탐색하며 제어 루프가 멈춘다.
         known = ~unknown
         ys, xs = known.nonzero()
+        outside = None
         if ys.size:
             m = int(1.0 / self.grid.res)          # 여유 1m
             y0 = max(0, ys.min() - m)
@@ -232,9 +237,39 @@ class Planner:
                 yy, xx = np.ogrid[y0:y1, x0:x1]
                 penalty[y0:y1, x0:x1] |= \
                     (xx - pcx) ** 2 + (yy - pcy) ** 2 <= r_c * r_c
-        path = astar(blocked, unknown, start, goal,
-                     unknown_cost=self.cfg.plan.unknown_cost,
-                     penalty=penalty, penalty_cost=8.0)
+        # 시작 셀이 표준 팽창에 물려 있으면(좁은 문/가구 틈에 서 있음)
+        # 표준 계획을 건너뛴다 — astar의 시작점 순간이동이 '가짜 성공'을
+        # 만들어 소프트 완화·마진 완화가 발동하지 못하는 데드락 방지
+        s_ix = min(max(start[0], 1), self.grid.n - 2)
+        s_iy = min(max(start[1], 1), self.grid.n - 2)
+        start_pinched = bool(blocked[s_iy, s_ix])
+        path = None
+        if not start_pinched:
+            path = astar(blocked, unknown, start, goal,
+                         unknown_cost=self.cfg.plan.unknown_cost,
+                         penalty=penalty, penalty_cost=8.0)
+        self.last_plan_soft = False
+        if path is None:
+            # 소프트 팽창 완화: 표준 여유로는 길이 전멸했을 때(탁자 다리
+            # 사이에 갇힘, 좁은 문뿐인 방) '팽창 여유 halo'를 고비용 통과
+            # 허용으로 재시도. halo는 물리적으로는 지나갈 수 있는 공간 —
+            # 벽에 가까울 뿐이다. hard 한계는 로봇 반경에서 셀 반치를 뺀
+            # 값으로 잡는다: 팽창이 점유 '셀 중심' 기준이라 셀 경계까지의
+            # 0.5셀이 이미 마진이고, 실제 접촉 방지는 LocalAvoider의
+            # 실거리 클램프가 담당한다.
+            hard = self.grid.inflated_mask(
+                max(self.grid.res * 1.5,
+                    self.cfg.robot.robot_radius - self.grid.res * 0.5))
+            if outside is not None:
+                hard = hard | outside
+            halo = blocked & ~hard
+            penalty2 = halo if penalty is None else (penalty | halo)
+            path = astar(hard, unknown, start, goal,
+                         unknown_cost=self.cfg.plan.unknown_cost,
+                         penalty=penalty2, penalty_cost=8.0)
+            if path is not None:
+                self.last_plan_soft = True
+                blocked, penalty = hard, penalty2
         if path is None:
             self.waypoints = []
             self._last_fail_t = now
@@ -301,6 +336,8 @@ class LocalAvoider:
         self._stop_turn = None       # 정지-회전 방향 래치 (좌우 진동 방지)
         self._front_hist = []        # 전방거리 중앙값 필터 (채터링 컷)
         self._stopped = False        # 정지 히스테리시스 상태
+        self.relax_until = -1e9      # 이 시각까지 안전 마진 일시 완화
+                                     # (갇힘 탈출 직후·소프트 경로 추종 중)
 
     def _dyn_trend(self, now, d_min):
         """(approaching, receding): 0.6s 창에서의 거리 추세."""
@@ -363,20 +400,33 @@ class LocalAvoider:
                 if math.hypot(lx, ly) < 0.05:               # 정확히 선로 위
                     lx, ly = -uy, ux
                 cands = []
-                # ① 수직 이탈 (선호)
+                # ① 수직 이탈 (선호) — 반대쪽 수직(선로 횡단)도 후보로:
+                #    이탈 쪽이 벽이면 건너편이 유일한 활로다 (순찰 반환점
+                #    코너에 몰리는 케이스)
                 cands.append((math.atan2(ly, lx), 0.45))
-                # ② 선로 따라 도주: 사람 이동 방향으로 앞서 있으면 그쪽으로
+                cands.append((math.atan2(-ly, -lx), 0.05))
+                # ② 선로 따라 도주: 사람 이동 방향으로 앞서 있으면 그쪽으로.
+                #    단, 후진으로만 가능한 도주는 최고 0.85×max_v — 사람
+                #    (0.2m/s)보다 느려 반드시 따라잡히는 필패 수이므로
+                #    강한 감점 (수직 이탈이 조금이라도 열려 있으면 그쪽)
                 flee = (ux, uy) if proj >= 0 else (-ux, -uy)
-                cands.append((math.atan2(flee[1], flee[0]), 0.15))
-                # ③ 후진 (현 헤딩 반대)
-                cands.append((pose[2] + math.pi, 0.0))
+                flee_ang = math.atan2(flee[1], flee[0])
+                fwd_ok = abs(wrap_angle(flee_ang - pose[2])) <= math.pi / 2
+                cands.append((flee_ang, 0.15 if fwd_ok else -1.2))
+                # ③ 후진 (현 헤딩 반대) — 로봇을 마주보는 사람에게 이건
+                #    ②의 후진 도주와 같은 필패 기동이므로 강한 감점.
+                #    (감점 없던 시절: 후방이 트이면 수직 이탈을 이겨서
+                #    복도에서 0.18 vs 0.2 후진 추격전 → 추돌)
+                cands.append((pose[2] + math.pi, -0.8))
                 best, best_score = None, -1e9
                 for world_ang, bonus in cands:
                     phi = wrap_angle(world_ang - pose[2])
                     c = self._clearance(a, r, phi)
                     if c < 0.3:                 # 벽/물체에 막힘
                         continue
-                    score = min(c, 2.0) + bonus
+                    # 여유 점수 상한 1.2: '넓게 트였다'는 이유만으로 나쁜
+                    # 방향(후진 도주)이 좋은 방향(수직 이탈)을 이기지 못하게
+                    score = min(c, 1.2) + bonus
                     if score > best_score:
                         best, best_score = (world_ang, c), score
                 if best is not None:
@@ -426,7 +476,6 @@ class LocalAvoider:
         if dynamic is not None:
             dyn = np.asarray(dynamic)[valid]
             if dyn.any():
-                self.blocked_since = None    # 정적 대기 타이머는 리셋
                 rd, ad = r[dyn], a[dyn]
                 j = int(np.argmin(rd))
                 d_min, b = float(rd[j]), float(ad[j])
@@ -483,10 +532,15 @@ class LocalAvoider:
                         else:
                             v, w = 0.0, 0.0
                     else:
-                        # 옆/뒤에서 접근 → 멈추면 치인다: 전속 이탈
+                        # 옆/뒤에서 접근 → 멈추면 치인다. 직진 전속(구
+                        # 방식)은 순찰선과 나란할 때 0.21 vs 0.2 무한
+                        # 추격전 — 수직 이탈 우선의 탈출 계산을 쓴다
                         self.last_mode = dyn_action = "sprint"
                         self._yield_since = None
-                        v = cfg.robot.max_v
+                        v, w = self._escape_cmd(d_min, b, pose,
+                                                person_xy, person_vel, a, r)
+                        if abs(v) < 0.05:
+                            v = cfg.robot.max_v      # 폴백: 그냥 내빼기
                 else:
                     self.last_mode = "watch"
             else:
@@ -506,12 +560,28 @@ class LocalAvoider:
         forward = r * np.cos(a)
         lateral = r * np.sin(a)
         rr = cfg.robot.robot_radius
+        # 갇힘 탈출 직후/소프트(팽창 완화) 경로 추종 중에는 마진을 일시
+        # 축소 — 표준 마진으로는 물리적으로 지나갈 수 있는 틈도 정지
+        # 대상이라, 계획이 허용한 틈을 회피가 도로 막는 모순이 생긴다.
+        # 접촉 한계(danger는 로봇 반경+3cm 아래로는 안 내려감)는 유지.
+        relaxed = now < self.relax_until
+        if dynamic is not None and np.asarray(dynamic)[valid].any():
+            relaxed = False    # 사람이 보이는 동안엔 마진 완화 금지 —
+                               # 완화된 danger가 사람 접촉 비상까지 늦춘다
+        # 완화 바닥값: 중앙값 필터 지연(~0.2s) 동안의 이동분을 견딜 표면
+        # 여유(4cm+)는 남긴다 — 이보다 깎으면 좁은 공간에서 실접촉이 난다
+        stop_d = max(rr + 0.05, cfg.plan.stop_dist * 0.7) if relaxed \
+            else cfg.plan.stop_dist
+        danger_d = min(cfg.plan.danger_dist, rr + 0.04) if relaxed \
+            else cfg.plan.danger_dist
+        corr_m = 0.02 if relaxed else cfg.plan.corridor_margin
+        lat_m = 0.03 if relaxed else 0.05
 
         # 1a) 비상: 반경 danger_dist 안 + 로봇 폭에 실제로 걸치는 물체.
         #     단, 전진하지 않는 제자리 회전은 원형 로봇에겐 접촉 불가 —
         #     정지 회전(SPIN 등)까지 방향을 뒤집으면 스핀이 영원히 안
         #     끝나는 데드락이 된다 (동적 위협이 없을 때만 면제).
-        touching = (r < cfg.plan.danger_dist) & (np.abs(lateral) < rr + 0.05)
+        touching = (r < danger_d) & (np.abs(lateral) < rr + lat_m)
         if touching.any() and (abs(v) > 0.02 or dyn_action is not None):
             j = int(np.argmin(np.where(touching, r, np.inf)))
             a_min = a[j]
@@ -526,7 +596,7 @@ class LocalAvoider:
 
         # 전방 코리도: 진행 폭(robot_radius+corridor_margin) 안의 최소 전방거리
         corridor = (forward > 0.02) \
-            & (np.abs(lateral) < rr + cfg.plan.corridor_margin)
+            & (np.abs(lateral) < rr + corr_m)
         front_raw = float(forward[corridor].min()) if corridor.any() \
             else float("inf")
         # 3샘플 중앙값 — LiDAR 노이즈 한 방으로 정지/재개가 튀는 것 방지
@@ -540,8 +610,8 @@ class LocalAvoider:
         left_min = r[left].min() if left.any() else cfg.lidar.max_range
         right_min = r[right].min() if right.any() else cfg.lidar.max_range
 
-        resume_dist = cfg.plan.stop_dist * 1.3
-        if front_min < cfg.plan.stop_dist \
+        resume_dist = stop_d * 1.3
+        if front_min < stop_d \
                 or (self._stopped and front_min < resume_dist):
             self._stopped = True
             # 전진 금지 (후진 탈출은 허용). 동적 제안이 없을 때만
@@ -565,8 +635,8 @@ class LocalAvoider:
             if dyn_action is None:
                 self.blocked_since = None
             if front_min < cfg.plan.slow_dist and v > 0:
-                scale = (front_min - cfg.plan.stop_dist) / \
-                        (cfg.plan.slow_dist - cfg.plan.stop_dist)
+                scale = (front_min - stop_d) / \
+                        (cfg.plan.slow_dist - stop_d)
                 v *= max(0.15, scale)
             # 틈 중앙 조준: 좁은 통로(한쪽이 0.5m 이내)에서는 전방이
             # 뚫려 있어도 항상 빈 공간 중앙을 향해 조향 — 문·가구 틈을
@@ -581,4 +651,8 @@ class LocalAvoider:
                 k_c = 1.2 * max(0.35, min(1.0, (gap - 0.35) / 0.55))
                 bias = max(-0.55, min(0.55, k_c * delta))
                 w = max(-cfg.robot.max_w, min(cfg.robot.max_w, w + bias))
+        # 완화 모드 속도 상한: 마진 4~5cm로 좁은 틈을 지나는 중 —
+        # 순항 속도로 코너를 자르면 문설주를 스친다. 저속 통과 강제.
+        if relaxed and v > 0.09:
+            v = 0.09
         return v, w, blocked_long

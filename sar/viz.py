@@ -43,6 +43,8 @@ class MapViz:
                 dot(c[0], c[1], (255, 165, 0), 1)
             for p in info.get("waypoints") or []:
                 dot(p[0], p[1], (80, 130, 255), 1)
+            for c in info.get("candidates") or []:
+                dot(c[0], c[1], (200, 0, 220), 2)   # 보라: 목표 후보
             if info.get("goal"):
                 dot(info["goal"][0], info["goal"][1], (0, 80, 255), 3)
             if info.get("target_est"):

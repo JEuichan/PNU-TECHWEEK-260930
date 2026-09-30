@@ -237,6 +237,35 @@ def test_compass_calibration():
     assert abs(est.pose[2] - (math.pi / 2 + 0.4)) < 1e-6, est.pose
 
 
+def test_plan_soft_relief():
+    """표준 팽창으로 닫힌 0.34m 틈 — 소프트 완화 재시도가 경로를 찾는다.
+
+    (탁자 다리 사이 갇힘 회귀: 계획 전멸 → 제자리 회전 무한 반복)"""
+    from sar.planning import Planner
+    cfg = default_config()
+    cfg.map.half_size = 3.0
+    grid = OccupancyGrid(cfg, center_xy=(0.0, 0.0))
+    grid.log[:, :] = -2.0                       # 전 영역 free 관측 가정
+    for x in np.arange(-3.0, 3.0, grid.res / 2):
+        if -0.17 < x < 0.17:                    # 틈 0.34m
+            continue
+        ix, iy = grid.world_to_grid(x, 0.0)
+        if 0 <= ix < grid.n and 0 <= iy < grid.n:
+            grid.log[iy, ix] = 5.0              # y=0 수평 벽
+    grid._version += 1
+    p = Planner(cfg, grid)
+    ok = p.plan_to((0.0, -1.0, 0.0), (0.0, 1.0), now=0.0, force=True)
+    assert ok, "소프트 완화가 틈 통과 경로를 찾아야 함"
+    assert p.last_plan_soft, "표준 팽창으론 닫힌 틈 — 소프트 경로여야 함"
+    # 경로가 실제로 벽 건너편 목표까지 이어지는지 확인
+    gx, gy = p.waypoints[-1]
+    assert math.hypot(gx - 0.0, gy - 1.0) < 0.3, p.waypoints[-1]
+    # 벽을 넘는 구간(부호가 바뀌는 인접 쌍)은 틈 근처(x≈0)여야 함
+    for (x0, y0), (x1, y1) in zip(p.waypoints, p.waypoints[1:]):
+        if y0 < 0 <= y1 or y1 < 0 <= y0:
+            assert abs(x0) < 0.4 and abs(x1) < 0.4, (x0, x1)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

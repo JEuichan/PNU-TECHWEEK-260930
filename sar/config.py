@@ -124,6 +124,8 @@ class PlanConfig:
                                          # (우회 판단 지연의 주범이던 4s 분리)
     # 동적 장애물(사람) 전용 — 사람이 로봇보다 빠르다는 전제의 조기 대응
     dyn_escape_dist: float = 0.50        # m, 이내면 적극 이탈
+                                         # (0.6 시도는 rooms_two 사람 충돌
+                                         # 퇴행 — 민감 균형값, 유지할 것)
     dyn_yield_dist: float = 0.95         # m, 접근 중이면 정지 양보
     # 동적 분류의 free 요구 수준: 벽은 빔이 통과 못 해 free 증거가 안 쌓이니
     # -1.2면 '갓 그려지는 벽'(log≈0~-0.5)을 확실히 배제하면서, 확실히
@@ -143,6 +145,12 @@ class PlanConfig:
 
 @dataclass
 class ExploreConfig:
+    # 벽 추종(우수법) 우선 탐사 — 외곽 일주로 지도 골격을 빠르게 완성.
+    # 루프 폐합/타임아웃 후 frontier 탐사가 실내 잔여 구역을 마무리.
+    # (mission.map_first=True일 때만 사용)
+    wall_follow: bool = True
+    wall_dist: float = 0.45              # m, 벽 추종 목표 거리
+    wall_timeout: float = 240.0          # s, 벽 추종 최대 시간 (안전망)
     min_cluster: int = 6                 # frontier 클러스터 최소 셀 수
     reach_tolerance: float = 0.35        # m, frontier 도달 판정
     spin_period: float = 16.0            # s, 주기적 카메라 스캔 간격 (0=끄기)
@@ -159,6 +167,11 @@ class MissionConfig:
     start_y: float = 0.0
     start_theta: float = 0.0
     num_targets: int = 1                 # 찾아야 할 목표 개수 (대회: 사과 2개)
+    # 지도 우선 전략(옵션): 탐사 중 목표는 '후보'로 기억만 하고 지도를
+    # 먼저 완성 → 후보 방문 확정. 기본은 False = 목표 우선(frontier로
+    # 빠르게 찾고 보이면 즉시 SEEK/GOTO) — 대회 목표(빠른 발견)에 부합.
+    map_first: bool = False
+    opportunistic_dist: float = 1.5      # m, 지도 우선 중에도 즉시 잡는 거리
     visited_radius: float = 0.9          # m, 방문한 목표 주변 재확정 금지 반경
     return_tolerance: float = 0.25       # m, 복귀 성공 판정
     target_standoff: float = 0.40        # m, 목표 앞 정지 거리

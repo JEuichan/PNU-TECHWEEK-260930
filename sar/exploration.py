@@ -94,7 +94,10 @@ class FrontierExplorer:
             if self._blacklisted(rep):
                 continue
             d = max(dist(pose, rep), 0.3)
-            score = len(comp) / d
+            # 거리 지수 1.7: 선형(size/d)은 먼 대형 frontier가 지금 있는
+            # 방의 작은 frontier를 이겨 "방에 들어갔다가 바로 나가는"
+            # 왕복 동선을 만든다 — 가까운 방부터 끝내고 이동해야 한다
+            score = len(comp) / (d ** 1.7)
             if person_xy is not None and dist(rep, person_xy) < 2.5:
                 score *= 0.35        # 사람 있는 방향은 후순위
             if score > best_score:
