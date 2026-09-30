@@ -555,7 +555,8 @@ class LocalAvoider:
                 w = self._stop_turn * cfg.robot.max_w * 0.5
                 if self.blocked_since is None:
                     self.blocked_since = now
-                elif now - self.blocked_since > cfg.plan.person_wait:
+                elif now - self.blocked_since > cfg.plan.static_wait:
+                    # 정적 막힘은 빠르게 우회 재계획 (사람 양보와 별도 타이머)
                     blocked_long = True
                     self.blocked_since = now
         else:

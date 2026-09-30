@@ -27,10 +27,12 @@ def rgb_to_hsv(img):
 
 class Detection:
     __slots__ = ("bearing", "pixels", "cx_ratio", "area_rows", "px_width",
-                 "ang_width", "clipped", "bbox", "aspect", "v_clipped")
+                 "ang_width", "clipped", "bbox", "aspect", "v_clipped",
+                 "fill")
 
     def __init__(self, bearing, pixels, cx_ratio, area_rows, px_width,
-                 ang_width, clipped, bbox=None, aspect=1.0, v_clipped=False):
+                 ang_width, clipped, bbox=None, aspect=1.0, v_clipped=False,
+                 fill=1.0):
         self.bearing = bearing        # rad, 로봇 프레임
         self.pixels = pixels
         self.cx_ratio = cx_ratio      # 0(왼쪽끝)~1(오른쪽끝)
@@ -41,6 +43,7 @@ class Detection:
         self.bbox = bbox              # (x0, y0, x1, y1) — YOLO 검증용
         self.aspect = aspect          # 가로/세로 비 (확정 단계 게이트용)
         self.v_clipped = v_clipped    # 상/하단 잘림 (근접 사과)
+        self.fill = fill              # 채움비 (사과=민무늬 ~0.75+, 캔=구멍)
 
 
 class TargetDetector:
@@ -66,6 +69,18 @@ class TargetDetector:
         except Exception as e:
             print(f"[detection] YOLO 사용 불가({e}) — 게이트 자동 통과")
             self._yolo_failed = True
+
+    def yolo_boxes(self, img_rgb):
+        """라이브 뷰용: YOLO 전체 탐지 박스 [(name, conf, xyxy)]. 실패 시 []."""
+        if self._yolo is None or img_rgb is None:
+            return []
+        try:
+            res = self._yolo.predict(source=img_rgb[..., ::-1],
+                                     conf=0.15, verbose=False)[0]
+            return [(res.names[int(b.cls)], float(b.conf),
+                     [float(t) for t in b.xyxy[0]]) for b in res.boxes]
+        except Exception:
+            return []
 
     def yolo_confirm(self, img_rgb, det):
         """확정 직전 1회 실행되는 YOLO 검증 게이트.
@@ -214,7 +229,8 @@ class TargetDetector:
                                     px_width, ang_width, clipped,
                                     bbox=(int(xs.min()), int(ys.min()),
                                           int(xs.max()), int(ys.max())),
-                                    aspect=aspect, v_clipped=v_clipped)
+                                    aspect=aspect, v_clipped=v_clipped,
+                                    fill=fill)
 
         if det is not None:
             self.consecutive += 1

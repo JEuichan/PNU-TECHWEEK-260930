@@ -58,6 +58,9 @@ def main():
     now = 0.0
     step_i = 0
     last_snap = -1e9
+    last_cam = -1e9
+    last_yolo = -1e9
+    yolo_cache = []
     last_state = None
     done_logged = False
     found_saved = False
@@ -94,8 +97,19 @@ def main():
                 print(f"[sar] found_frame 저장 실패: {e}")
         if SNAPSHOT_EVERY_S > 0 and now - last_snap >= SNAPSHOT_EVERY_S:
             last_snap = now
-            viz.save(os.path.join(SNAPSHOT_DIR, "live_map.png"),
-                     pose=pose, info=info)
+            # 경량 렌더 — matplotlib figure는 제어 루프를 수백 ms 블록
+            viz.save_fast(os.path.join(SNAPSHOT_DIR, "live_map.png"),
+                          pose=pose, info=info)
+        # 카메라 라이브 뷰 (블롭=노랑, YOLO=초록). YOLO는 후보가 보일 때만
+        # 4초 간격으로 (CPU 추론 ~0.2s — 상시 돌리면 그 자체가 병목)
+        if now - last_cam >= 1.0 and img is not None:
+            last_cam = now
+            if mission.detector.visible and now - last_yolo >= 4.0:
+                last_yolo = now
+                yolo_cache = mission.detector.yolo_boxes(img)
+            viz.save_camera(os.path.join(SNAPSHOT_DIR, "live_cam.png"),
+                            img, det=mission.detector.last,
+                            yolo_boxes=yolo_cache)
         if info["state"] == Mission.DONE and not done_logged:
             done_logged = True
             print(f"[sar] MISSION DONE t={now:.1f}s — 정지 유지")

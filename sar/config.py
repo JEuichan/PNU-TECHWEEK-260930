@@ -107,7 +107,7 @@ class PlanConfig:
     inflate_margin: float = 0.07         # m, robot_radius 에 더하는 여유
     unknown_cost: float = 2.5            # A*에서 미지 셀 통과 비용 배율
     goal_tolerance: float = 0.15         # m
-    replan_period: float = 1.5           # s
+    replan_period: float = 2.5           # s (사람 보이면 0.8s로 자동 단축)
     lookahead: float = 0.35              # m, pure pursuit 전방 주시 거리
     k_heading: float = 2.2               # 헤딩 오차 → 각속도 게인
     # 반응형 회피 — 전방 판정은 '각도 부채꼴'이 아니라 '충돌 코리도'
@@ -120,6 +120,8 @@ class PlanConfig:
                                          # 경로상 장애물에만 반응 — 안전)
     danger_dist: float = 0.20            # m, 전방향 비상 탈출 발동 거리
     person_wait: float = 4.0             # s, 동적 장애물 양보 대기 후 재계획
+    static_wait: float = 1.2             # s, '정적' 막힘의 재계획 대기
+                                         # (우회 판단 지연의 주범이던 4s 분리)
     # 동적 장애물(사람) 전용 — 사람이 로봇보다 빠르다는 전제의 조기 대응
     dyn_escape_dist: float = 0.50        # m, 이내면 적극 이탈
     dyn_yield_dist: float = 0.95         # m, 접근 중이면 정지 양보

@@ -105,6 +105,10 @@ class Mission:
         # 가려진 반달 사과는 단안 거리가 2배로 튀므로 SEEK로 더 접근시킨다.
         if not det.v_clipped and not (0.55 <= det.aspect <= 1.7):
             return
+        # 채움비 확정 게이트: 사과는 민무늬 원(≥0.6), 라벨/그래픽 있는
+        # 캔·병은 마스크에 구멍이 나 채움비가 낮다 (빨간 콜라캔 오인 방지)
+        if det.fill < 0.6:
+            return
         accepted = None
 
         est = estimate_target_position(pose, det.bearing, angles, ranges)

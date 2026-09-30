@@ -5,9 +5,12 @@
 """
 import math
 
+import numpy as np
+
 try:
     import matplotlib
     matplotlib.use("Agg")
+    import matplotlib.image as mpimage
     import matplotlib.pyplot as plt
     HAVE_MPL = True
 except Exception:  # matplotlib 미설치 환경
@@ -18,6 +21,63 @@ class MapViz:
     def __init__(self, grid):
         self.grid = grid
         self.enabled = HAVE_MPL
+
+    def save_fast(self, path, pose=None, info=None):
+        """경량 실시간 렌더(~10ms) — matplotlib figure는 스냅샷마다
+        제어 루프를 수백 ms 블록해 주기적 스터터를 만든다. 픽셀 합성으로 대체."""
+        if not self.enabled:
+            return
+        g = self.grid
+        img = np.full((g.n, g.n, 3), 165, dtype=np.uint8)   # 미지 = 회색
+        img[g.free_mask()] = (245, 245, 245)
+        img[g.occupied_mask()] = (25, 25, 25)
+
+        def dot(x, y, color, r=2):
+            ix, iy = g.world_to_grid(x, y)
+            if 0 <= ix < g.n and 0 <= iy < g.n:
+                img[max(0, iy - r):iy + r + 1,
+                    max(0, ix - r):ix + r + 1] = color
+
+        if info:
+            for c in info.get("crumbs") or []:
+                dot(c[0], c[1], (255, 165, 0), 1)
+            for p in info.get("waypoints") or []:
+                dot(p[0], p[1], (80, 130, 255), 1)
+            if info.get("goal"):
+                dot(info["goal"][0], info["goal"][1], (0, 80, 255), 3)
+            if info.get("target_est"):
+                dot(info["target_est"][0], info["target_est"][1],
+                    (255, 0, 0), 4)
+        if pose is not None:
+            dot(pose[0], pose[1], (0, 190, 0), 3)
+            tip = (pose[0] + 0.28 * math.cos(pose[2]),
+                   pose[1] + 0.28 * math.sin(pose[2]))
+            dot(tip[0], tip[1], (0, 120, 0), 1)
+        mpimage.imsave(path, img[::-1])   # origin='lower' 뒤집기
+
+    @staticmethod
+    def save_camera(path, img_rgb, det=None, yolo_boxes=()):
+        """카메라 라이브 뷰: HSV 블롭(노랑)·YOLO 박스(초록) 테두리 합성."""
+        if not HAVE_MPL or img_rgb is None:
+            return
+        out = img_rgb.copy()
+        hh, ww = out.shape[:2]
+
+        def rect(x0, y0, x1, y1, color):
+            x0 = max(0, min(ww - 1, int(x0)))
+            x1 = max(0, min(ww - 1, int(x1)))
+            y0 = max(0, min(hh - 1, int(y0)))
+            y1 = max(0, min(hh - 1, int(y1)))
+            out[y0:y0 + 2, x0:x1 + 1] = color
+            out[max(0, y1 - 1):y1 + 1, x0:x1 + 1] = color
+            out[y0:y1 + 1, x0:x0 + 2] = color
+            out[y0:y1 + 1, max(0, x1 - 1):x1 + 1] = color
+
+        for (_name, _conf, (a, b, c, d)) in yolo_boxes:
+            rect(a, b, c, d, (0, 255, 0))
+        if det is not None and det.bbox is not None:
+            rect(*det.bbox, (255, 255, 0))
+        mpimage.imsave(path, out)
 
     def save(self, path, pose=None, info=None, true_pose=None, world_extras=None):
         if not self.enabled:
