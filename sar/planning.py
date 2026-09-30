@@ -164,6 +164,7 @@ class Planner:
         self.avoid_territory = []    # 사람이 다녀간 자리들 (순찰 영토)
         self.furniture_xy = []       # YOLO 가구 구역 — 밑으로 안 파고들게
         self.last_plan_soft = False  # 마지막 경로가 팽창 완화(halo 통과)였나
+        self.soft_spots = []         # 경로 중 halo(좁은 틈) 구간 월드 좌표
 
     @property
     def goal(self):
@@ -188,7 +189,16 @@ class Planner:
         self._last_plan_t = now
         self._goal = tuple(goal_xy)
         radius = self.cfg.robot.robot_radius + self.cfg.plan.inflate_margin
-        blocked = self.grid.inflated_mask(radius)
+        # 이중 팽창: hard(물리 한계)=차단, halo(표준 여유 구간)=고비용
+        # 통과 허용. halo를 항상 페널티로 두면 A*가 "우회로가 틈보다
+        # 8배 이상 길 때"만 좁은 틈을 고른다 — 예전 2단계(표준 실패
+        # 시에만 완화)는 먼 우회로가 존재하는 한 좁은 틈을 한 번도
+        # 시도하지 않아 거실 가구 사이에서 왔던 길만 되돌아갔다.
+        soft_blocked = self.grid.inflated_mask(radius)
+        blocked = self.grid.inflated_mask(
+            max(self.grid.res * 1.5,
+                self.cfg.robot.robot_radius - self.grid.res * 0.5))
+        halo = soft_blocked & ~blocked
         unknown = self.grid.unknown_mask()
         start = self.grid.world_to_grid(pose[0], pose[1])
         goal = self.grid.world_to_grid(*goal_xy)
@@ -207,11 +217,12 @@ class Planner:
             outside = np.ones_like(blocked)
             outside[y0:y1, x0:x1] = False
             blocked = blocked | outside
-        penalty = None
+        penalty = halo.copy()
+        if outside is not None:
+            penalty &= ~outside
         if self.furniture_xy:
             # 가구(탁자 다리 사이 등) 구역: 통과 불가는 아니지만 비싸게 —
             # 다른 길이 있으면 밑으로 파고들지 않는다
-            penalty = np.zeros_like(blocked)
             g = self.grid
             r_c = max(2, int(0.45 / g.res))
             for fx, fy in self.furniture_xy:
@@ -254,43 +265,22 @@ class Planner:
                 yy, xx = np.ogrid[y0:y1, x0:x1]
                 penalty[y0:y1, x0:x1] |= \
                     (xx - pcx) ** 2 + (yy - pcy) ** 2 <= r_c * r_c
-        # 시작 셀이 표준 팽창에 물려 있으면(좁은 문/가구 틈에 서 있음)
-        # 표준 계획을 건너뛴다 — astar의 시작점 순간이동이 '가짜 성공'을
-        # 만들어 소프트 완화·마진 완화가 발동하지 못하는 데드락 방지
-        s_ix = min(max(start[0], 1), self.grid.n - 2)
-        s_iy = min(max(start[1], 1), self.grid.n - 2)
-        start_pinched = bool(blocked[s_iy, s_ix])
-        path = None
-        if not start_pinched:
-            path = astar(blocked, unknown, start, goal,
-                         unknown_cost=self.cfg.plan.unknown_cost,
-                         penalty=penalty, penalty_cost=8.0)
-        self.last_plan_soft = False
+        path = astar(blocked, unknown, start, goal,
+                     unknown_cost=self.cfg.plan.unknown_cost,
+                     penalty=penalty, penalty_cost=8.0)
         if path is None:
-            # 소프트 팽창 완화: 표준 여유로는 길이 전멸했을 때(탁자 다리
-            # 사이에 갇힘, 좁은 문뿐인 방) '팽창 여유 halo'를 고비용 통과
-            # 허용으로 재시도. halo는 물리적으로는 지나갈 수 있는 공간 —
-            # 벽에 가까울 뿐이다. hard 한계는 로봇 반경에서 셀 반치를 뺀
-            # 값으로 잡는다: 팽창이 점유 '셀 중심' 기준이라 셀 경계까지의
-            # 0.5셀이 이미 마진이고, 실제 접촉 방지는 LocalAvoider의
-            # 실거리 클램프가 담당한다.
-            hard = self.grid.inflated_mask(
-                max(self.grid.res * 1.5,
-                    self.cfg.robot.robot_radius - self.grid.res * 0.5))
-            if outside is not None:
-                hard = hard | outside
-            halo = blocked & ~hard
-            penalty2 = halo if penalty is None else (penalty | halo)
-            path = astar(hard, unknown, start, goal,
-                         unknown_cost=self.cfg.plan.unknown_cost,
-                         penalty=penalty2, penalty_cost=8.0)
-            if path is not None:
-                self.last_plan_soft = True
-                blocked, penalty = hard, penalty2
-        if path is None:
+            self.last_plan_soft = False
             self.waypoints = []
             self._last_fail_t = now
             return False
+        # 경로가 halo(좁은 틈)를 지나면 '소프트 경로'. 완화는 경로 전체가
+        # 아니라 좁은 구간(soft_spots) 근처에서만 — 전 구간 완화는 열린
+        # 공간에서도 저속·저마진이 걸려 느리고 위험해진다.
+        g = self.grid
+        self.soft_spots = [
+            g.grid_to_world(cx, cy) for cx, cy in path[::2]
+            if 0 <= cy < g.n and 0 <= cx < g.n and halo[cy, cx]][:80]
+        self.last_plan_soft = bool(self.soft_spots)
         # LOS 단축 시 사람 캡슐(penalty)도 벽 취급 — 지름길이 캡슐을
         # 관통하면 A*의 우회가 무의미해진다
         los_blocked = blocked | penalty if penalty is not None else blocked
@@ -355,6 +345,7 @@ class LocalAvoider:
         self._stopped = False        # 정지 히스테리시스 상태
         self.relax_until = -1e9      # 이 시각까지 안전 마진 일시 완화
                                      # (갇힘 탈출 직후·소프트 경로 추종 중)
+        self._esc_latch = None       # (world_ang, until) 탈출 방향 래치
 
     def _dyn_trend(self, now, d_min):
         """(approaching, receding): 0.6s 창에서의 거리 추세."""
@@ -365,6 +356,23 @@ class LocalAvoider:
             return False, False
         d0 = self._dyn_hist[0][1]
         return d_min < d0 - 0.015, d_min > d0 + 0.02
+
+    @staticmethod
+    def _miss_lat(pose, person_xy, person_vel):
+        """사람 진행 선로 기준 내 측방 이격 (m). 판정 불가/뒤쪽이면 None."""
+        if pose is None or person_xy is None or person_vel is None:
+            return None
+        vx_, vy_ = person_vel
+        sp = math.hypot(vx_, vy_)
+        if sp < 0.1:
+            return None
+        dx_ = pose[0] - person_xy[0]
+        dy_ = pose[1] - person_xy[1]
+        ux, uy = vx_ / sp, vy_ / sp
+        proj = dx_ * ux + dy_ * uy
+        if proj < -0.1:
+            return None
+        return math.hypot(dx_ - proj * ux, dy_ - proj * uy)
 
     @staticmethod
     def _safe_pass(pose, person_xy, person_vel):
@@ -397,7 +405,22 @@ class LocalAvoider:
             return 10.0
         return float(r[sel].min())
 
-    def _escape_cmd(self, d_min, b, pose, person_xy, person_vel, a, r):
+    def _cmd_toward(self, world_ang, c, pose):
+        """월드 방향 world_ang로의 (v,w) — 전방이면 전진, 후방이면 후진."""
+        cfg = self.cfg
+        err = wrap_angle(world_ang - pose[2])
+        speed = cfg.robot.max_v * max(0.3, min(1.0, (c - 0.2) / 0.4))
+        if abs(err) <= math.pi / 2:
+            v_e = speed
+            w_e = max(-cfg.robot.max_w, min(cfg.robot.max_w, 2.5 * err))
+        else:
+            err_b = wrap_angle(world_ang + math.pi - pose[2])
+            v_e = -speed * 0.85
+            w_e = max(-cfg.robot.max_w, min(cfg.robot.max_w, 2.5 * err_b))
+        return v_e, w_e
+
+    def _escape_cmd(self, d_min, b, pose, person_xy, person_vel, a, r,
+                    now=0.0):
         """탈출 명령 계산 — 후보 방향을 LiDAR 여유로 점수화해 선택.
 
         후보: ① 사람 진행 선로에서 수직 이탈, ② 선로를 따라 사람 반대쪽
@@ -409,6 +432,13 @@ class LocalAvoider:
             vx_, vy_ = person_vel
             sp = math.hypot(vx_, vy_)
             if sp > 0.1:
+                # 방향 래치(1s): 매 틱 재선정은 여유 요동으로 전진↔후진이
+                # 진동(디더링)해 탈출이 제자리걸음이 된다
+                if self._esc_latch is not None and now < self._esc_latch[1]:
+                    ang0 = self._esc_latch[0]
+                    c0 = self._clearance(a, r, wrap_angle(ang0 - pose[2]))
+                    if c0 > 0.28:
+                        return self._cmd_toward(ang0, c0, pose)
                 dx_ = pose[0] - person_xy[0]
                 dy_ = pose[1] - person_xy[1]
                 ux, uy = vx_ / sp, vy_ / sp
@@ -448,19 +478,8 @@ class LocalAvoider:
                         best, best_score = (world_ang, c), score
                 if best is not None:
                     world_ang, c = best
-                    err = wrap_angle(world_ang - pose[2])
-                    speed = cfg.robot.max_v * max(0.3, min(
-                        1.0, (c - 0.2) / 0.4))
-                    if abs(err) <= math.pi / 2:             # 전진 이탈
-                        v_e = speed
-                        w_e = max(-cfg.robot.max_w,
-                                  min(cfg.robot.max_w, 2.5 * err))
-                    else:                                   # 후진 이탈
-                        err_b = wrap_angle(world_ang + math.pi - pose[2])
-                        v_e = -speed * 0.85
-                        w_e = max(-cfg.robot.max_w,
-                                  min(cfg.robot.max_w, 2.5 * err_b))
-                    return v_e, w_e
+                    self._esc_latch = (world_ang, now + 1.0)
+                    return self._cmd_toward(world_ang, c, pose)
                 return 0.0, 0.0                 # 사방이 막힘: 정지가 최선
         # 폴백: bearing 휴리스틱 (전진 선택 시 전방 여유 확인)
         if abs(b) < 0.45:
@@ -520,7 +539,7 @@ class LocalAvoider:
                 elif d_min < escape_d:
                     self.last_mode = dyn_action = "escape"
                     v, w = self._escape_cmd(d_min, b, pose,
-                                            person_xy, person_vel, a, r)
+                                            person_xy, person_vel, a, r, now)
                     self._yield_since = self._yield_since or now
                     self._commit_until = -1e9             # 커밋 취소
                     if d_min < 0.4:
@@ -534,7 +553,13 @@ class LocalAvoider:
                     v = max(v, cfg.robot.max_v * 0.9)
                 elif d_min < cfg.plan.dyn_yield_dist and approaching \
                         and not passing:
-                    if abs(b) < 1.05:
+                    lat_ = self._miss_lat(pose, person_xy, person_vel)
+                # 서 있어도 안전한 자리인가: 선로 이격 0.35m+ 확인됐거나
+                # 아직 충분히 멀 때만. 속도 미상(반환점 등)이면 근접
+                # 정지 양보 금지 — 그 자리가 선로 위일 수 있다.
+                safe_spot = (lat_ is not None and lat_ >= 0.35) \
+                    or d_min >= 0.7
+                if abs(b) < 1.05 and safe_spot:
                         # 위협이 진행방향 안 → 양보 (멀면 서행, 가까우면 정지)
                         self.last_mode = dyn_action = "yield"
                         if self._yield_since is None:
@@ -555,7 +580,7 @@ class LocalAvoider:
                         self.last_mode = dyn_action = "sprint"
                         self._yield_since = None
                         v, w = self._escape_cmd(d_min, b, pose,
-                                                person_xy, person_vel, a, r)
+                                                person_xy, person_vel, a, r, now)
                         if abs(v) < 0.05:
                             v = cfg.robot.max_v      # 폴백: 그냥 내빼기
                 else:

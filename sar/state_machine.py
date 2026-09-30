@@ -75,6 +75,13 @@ class Mission:
         # 스택은 이 레이어가 뚫렸을 때의 최후 수단.
         self.furniture_zones = []    # [(x, y)]
 
+        # 구역 맴돌기 감지: 움직이고는 있는데 40초째 같은 방 안에서
+        # 왔다갔다 → 벽 추종으로 이동 패턴을 깨고 나간다
+        self._region_hist = []       # [(t, x, y)]
+        self._region_check_t = -1e9
+        self._region_escape_cd = -1e9
+        self._wf_escape_until = None  # 벽 추종 '탈출 모드' 종료 시각
+
         # stuck 감지
         self._pose_hist = []         # [(t, x, y)]
         self._recover_phase = None   # ("backup"|"align"|"creep", 시작시각)
@@ -559,6 +566,36 @@ class Mission:
                 and now - self.start_time > cfg.mission.give_up_time:
             self._enter(self.RETURN, now)
 
+        # 구역 맴돌기: 이동은 하는데 40s째 좁은 구역 안 — frontier와
+        # 회피의 충돌로 같은 길만 왕복하는 패턴. 벽 추종으로 깨고 나간다.
+        self._region_hist.append((now, pose[0], pose[1]))
+        while self._region_hist and self._region_hist[0][0] < now - 42.0:
+            self._region_hist.pop(0)
+        if now - self._region_check_t >= 5.0 \
+                and self.state in (self.EXPLORE, self.SEEK) \
+                and self.planner.avoid_xy is None \
+                and now > self._region_escape_cd:
+            self._region_check_t = now
+            h = self._region_hist
+            if h and now - h[0][0] >= 40.0:
+                xs_ = [p[1] for p in h]
+                ys_ = [p[2] for p in h]
+                span = math.hypot(max(xs_) - min(xs_), max(ys_) - min(ys_))
+                path_len = sum(
+                    math.hypot(h[i + 1][1] - h[i][1], h[i + 1][2] - h[i][2])
+                    for i in range(len(h) - 1))
+                if span < 2.2 and path_len > 4.0:
+                    print(f"[mission] 구역 맴돌기 감지(40s 반경 "
+                          f"{span:.1f}m, 이동 {path_len:.1f}m) — "
+                          f"벽 추종으로 패턴 파괴")
+                    self._region_escape_cd = now + 90.0
+                    self._region_hist.clear()
+                    self.explorer.blacklist.clear()
+                    self.explorer.current_target = None
+                    self._wf_escape_until = now + 40.0
+                    self._wf_anchor = None
+                    self._enter(self.WALL_FOLLOW, now)
+
         # stuck → RECOVER (SPIN/DONE/RECOVER 제외)
         if self.state in (self.EXPLORE, self.SEEK, self.GOTO_TARGET,
                           self.WALL_FOLLOW, self.VISIT, self.RETURN) \
@@ -606,11 +643,13 @@ class Mission:
         }[self.state]
         v, w = handler(now, pose, angles, ranges)
 
-        # 소프트(팽창 완화) 경로를 타는 동안엔 회피 마진도 함께 완화 —
-        # 계획이 허용한 좁은 틈을 회피가 도로 막는 모순 방지
-        if self.planner.last_plan_soft:
+        # 소프트 경로의 '좁은 구간' 근처에서만 회피 마진 완화 —
+        # 계획이 허용한 틈을 회피가 도로 막는 모순 방지 (열린 구간은
+        # 표준 마진·순항 속도 유지)
+        if self.planner.last_plan_soft and any(
+                dist(pose, s) < 0.6 for s in self.planner.soft_spots):
             self.avoider.relax_until = max(self.avoider.relax_until,
-                                           now + 2.0)
+                                           now + 1.0)
         # 로봇이 표준 팽창 영역 '안'에 서 있으면(문틈·가구 틈 한가운데)
         # 마진 완화 — 표준 마진은 이 자리 자체를 부정하므로 그대로는
         # 문설주에 막혀 옴짝달싹 못 한다 (0.5s 스로틀: 팽창 마스크 비용).
@@ -708,7 +747,8 @@ class Mission:
             self._enter(self._spin_return_state, now)
             return 0.0, 0.0
         dth = wrap_angle(pose[2] - self._last_theta)
-        full = not self._initial_spin_done or self._force_full_spin
+        full = self._force_full_spin or (
+            not self._initial_spin_done and cfg.explore.initial_full_spin)
         # 시간 상한: 어떤 외부 간섭(회피 개입 등)이 있어도 스핀은 반드시
         # 끝난다 — 스핀 무한 루프 데드락 방지
         limit = (2 * math.pi / (cfg.robot.max_w * 0.5) + 5.0) if full \
@@ -740,6 +780,7 @@ class Mission:
         if self.spin_accum <= -half:
             self.spin_accum = 0.0
             self.last_spin_t = now
+            self._initial_spin_done = True   # 초기 스윕도 여기로 끝난다
             self._enter(self._spin_return_state, now)
             return 0.0, 0.0
         return 0.0, -cfg.robot.max_w * 0.6
@@ -752,6 +793,14 @@ class Mission:
         (경로 6m+ 이동 후 시작 앵커 0.6m 복귀) 또는 타임아웃 →
         frontier 탐사가 실내 잔여 미탐색 구역을 마무리한다."""
         cfg = self.cfg
+        # 맴돌기-탈출 모드: 제한 시간 동안만 벽을 타고 구역을 벗어난 뒤
+        # frontier 탐사로 복귀 (지도 우선 모드가 아니어도 사용)
+        if self._wf_escape_until is not None \
+                and now > self._wf_escape_until:
+            self._wf_escape_until = None
+            self._wf_active = False
+            self._enter(self.EXPLORE, now)
+            return 0.0, 0.0
         # 주기 카메라 스윕 (후보 발견은 카메라 몫 — 벽만 보면 못 찾는다)
         if cfg.explore.spin_period > 0 \
                 and now - self.last_spin_t > cfg.explore.spin_period:
@@ -1090,6 +1139,11 @@ class Mission:
             if esc:
                 self._recover_phase = ("creep", now)
                 self._creep_start = (pose[0], pose[1])
+                # 점 목표 추종: 고정 헤딩 유지는 횡편차를 보정하지 못해
+                # 비스듬히 진입하면 문설주 쪽으로 흘러가 스친다
+                self._creep_goal = (
+                    pose[0] + 1.0 * math.cos(self._escape_heading),
+                    pose[1] + 1.0 * math.sin(self._escape_heading))
                 return 0.0, 0.0
             return self._finish_recover(now, pose)
         # creep: 틈 중앙을 향해 저속 전진 — 양옆이 막혀 있는 동안(문설주
@@ -1114,7 +1168,8 @@ class Mission:
         max_d = 1.0 if flanked else 0.55
         if front < 0.16 or creeped > max_d or now - t0 > 9.0:
             return self._finish_recover(now, pose)
-        err = wrap_angle(self._escape_heading - pose[2])
+        err = wrap_angle(math.atan2(self._creep_goal[1] - pose[1],
+                                    self._creep_goal[0] - pose[0]) - pose[2])
         w = max(-0.8, min(0.8, 1.8 * err))
         if min(l_lat, r_lat) < 0.25:     # 틈 안: 중앙 유지가 헤딩보다 우선
             w += max(-0.5, min(0.5, 1.6 * (l_lat - r_lat)))

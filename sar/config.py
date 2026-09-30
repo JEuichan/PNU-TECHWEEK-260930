@@ -113,7 +113,8 @@ class PlanConfig:
     # 반응형 회피 — 전방 판정은 '각도 부채꼴'이 아니라 '충돌 코리도'
     # (로봇 진행 폭 안의 물체만). 부채꼴 방식은 문설주를 정면 장애물로
     # 오인해 문 통과마다 감속·정지를 유발한다.
-    corridor_margin: float = 0.05        # m, 코리도 반폭 = robot_radius + 이 값
+    corridor_margin: float = 0.04        # m, 코리도 반폭 = robot_radius + 이 값
+                                         # (0.05는 가구 틈 통과를 과하게 차단)
     front_halfwidth: float = 0.75        # rad, (구) 섹터 반각 — 좌우 여유 계산용
     slow_dist: float = 0.45              # m, 이하부터 감속
     stop_dist: float = 0.20              # m, 이하 정지 (코리도 판정이라
@@ -151,6 +152,9 @@ class ExploreConfig:
     wall_follow: bool = True
     wall_dist: float = 0.45              # m, 벽 추종 목표 거리
     wall_timeout: float = 240.0          # s, 벽 추종 최대 시간 (안전망)
+    # 초기 스핀: LiDAR는 360°라 회전이 필요 없다 — 회전은 60° 카메라용.
+    # False면 시작도 ±spin_arc/2 스윕만 (한 바퀴 ~13s 절약)
+    initial_full_spin: bool = False
     min_cluster: int = 6                 # frontier 클러스터 최소 셀 수
     reach_tolerance: float = 0.35        # m, frontier 도달 판정
     spin_period: float = 16.0            # s, 주기적 카메라 스캔 간격 (0=끄기)
